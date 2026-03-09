@@ -1,0 +1,1597 @@
+---
+title: "Community Responses to SWISLR - Community Data Processing and Analysis"
+author: "Aeran Coughlin"
+date: "2026-02-19"
+output:
+  html_document:
+    toc: true
+---
+
+```{r}
+# Install packages
+library(tidyverse)
+library(lme4)
+library(ape)
+library(car)
+library(gdm)
+library(vegan)
+library(labdsv)
+library(reshape2)
+library(ggpubr)
+library(TITAN2)
+
+# Load files
+env <- read.csv("swislr_env.csv") # soil and geospatial data
+cover <- read.csv("swislr_cover.csv") # understory vegetation
+pcq <- read.csv("swislr_pcq.csv") # trees and shrubs
+spec <- read.csv("swislr_veg-species.csv") # list of all plant species
+fun.otu <- read.csv("swislr_fungal-table.csv") # fungal OTU table
+fun.tax <- read.csv("swislr_fungal-taxa.csv") # fungal taxonomy table
+bac.otu <- read.csv("swislr_bac-table.csv") # bacterial OTU table
+bac.tax <- read.csv("swislr_bac-taxa.csv") # bacterial taxonomy table
+
+# Set color scheme for plots
+color <- c("Woody Vegetation" = "#009C29", 
+           "Fungal" = "#FF7CAC", 
+           "Understory"= "#E8E800", 
+           "Bacterial"="#2949C5", 
+           "Dead Tree" = "#2F2F2F", 
+           "Shrub" = "#abab02")
+```
+
+### Data Processing and Reformatting
+
+##### Trees and Shrubs
+
+We collected circumference of overstory species and diameter of understory species. We calculate basal area for both types and then merge into a single column, then basal area is summed by species for each plot.
+
+```{r}
+# Calculate basal area 
+# A = c^2 / 4*pi
+# A = pi*d^2 / 4
+pcq.sum <- pcq %>% 
+  mutate(over.ba = ((circumference^2) / (4*3.141593))) %>% # overstory (from circumference)
+  mutate(under.ba = ((3.141593*(diameter^2)) / 4)) %>% # understory (from diameter)
+  mutate(ba = coalesce(over.ba, under.ba)) %>% # merge over and understory
+  select(plot.code, species, ba) %>% 
+  group_by(plot.code, species) %>% 
+  subset(species!="") %>% 
+  summarise(ba.sum=sum(ba)) %>% # sum basal area by plot and species
+  as.data.frame() %>%
+  arrange(plot.code)
+
+# Convert df to species matrix for analysis
+ba.matrix <- matrify(pcq.sum)
+
+ba.long <- melt(as.matrix(ba.matrix))
+
+ba.sum <- ba.long %>% 
+  rename("plot.code"="Var1") %>% 
+  rename("species"="Var2") %>% 
+  rename("ba.sum"="value")
+```
+
+
+##### Understory Vegetation
+
+Understory species abundances were collected as percent cover.
+
+```{r}
+## convert all values to numeric ##
+cover.sum <- cover %>% 
+  select(-c(year)) %>% 
+  mutate(percent.cover = as.character(percent.cover)) %>% 
+  mutate(percent.cover = replace(percent.cover, percent.cover == "<1", "0.5")) %>% 
+  mutate(percent.cover = as.numeric(percent.cover))
+
+# Convert df to species matrix for analysis
+cov.matrix <- matrify(cover.sum)
+```
+
+##### Fungi
+
+```{r}
+# Assess read numbers across samples
+fun.otu %>% 
+  mutate(rowsum = rowSums(select_if(., is.numeric), na.rm = TRUE)) %>% 
+  select(plot.code, rowsum) %>% 
+  summarise(min=min(rowsum))
+
+# Change plot code column to row names
+fun.matrix <- fun.otu %>%
+  column_to_rownames(var="plot.code")
+```
+
+
+##### Bacteria
+
+```{r}
+# Assess read numbers across samples
+bac.otu %>% 
+  mutate(rowsum = rowSums(select_if(., is.numeric), na.rm = TRUE)) %>% 
+  select(plot.code, rowsum) %>% 
+  summarise(min=min(rowsum)) #12684
+
+# Change plot code column to row names
+bac.matrix <- bac.otu %>% 
+  column_to_rownames(var="plot.code")
+```
+
+
+### Vegetation Abundance Analysis
+
+Testing hypotheses about which SWISLR stressor best predicts the abundance of vegetation.
+
+```{r}
+# Create one df of abundance of all vegetation types
+
+# Herbaceous understory percent cover 
+herb.sum <- cover.sum %>% 
+  left_join(spec, by="species") %>% 
+  filter(category!="tree" & category!="shrub") %>%
+  group_by(plot.code) %>% 
+  summarise(herb.sum=sum(percent.cover)) %>% 
+  mutate(herb.sum=replace(herb.sum, herb.sum > 100, 100))
+
+# Shrub basal area total
+ba.sum.shrub <- ba.sum %>% 
+  filter(species=="Baccharis halimifolia" | 
+           species=="Clethra alnifolia" | 
+           species=="Ilex coriacea" | 
+           species=="Ilex glabra" | 
+           species=="Lyonia lucida" | 
+           species=="Myrica cerifera" |
+           species=="Persea palustris" |
+           species=="Vaccinium sp.") %>% 
+  group_by(plot.code) %>% 
+  summarise(shrub.ba=sum(ba.sum))
+
+# Tree basal area log total and presence/absence
+ba.log.sum.tree <- ba.sum %>% 
+  mutate(log.ba.sum = if_else(ba.sum > 0, log(ba.sum), 0)) %>% 
+  filter(species=="Pinus taeda" | 
+           species=="Liquidambar styraciflua" | 
+           species=="Acer rubrum" | 
+           species=="Pinus serotina") %>%
+  group_by(plot.code) %>% 
+  summarise(tree.log.ba=sum(log.ba.sum)) %>% 
+  mutate(tree.pres = if_else(tree.log.ba > 0, 1, 0))
+
+# Tree basal area total
+ba.sum.tree <- ba.sum %>% 
+  filter(species=="Pinus taeda" | 
+           species=="Liquidambar styraciflua" | 
+           species=="Acer rubrum" | 
+           species=="Pinus serotina") %>%
+  group_by(plot.code) %>% 
+  summarise(tree.ba=sum(ba.sum))
+
+# Dead tree area total
+ba.sum.dead <- ba.sum %>% 
+  filter(species=="dead tree") %>% 
+  group_by(plot.code) %>% 
+  summarise(dead.sum=sum(ba.sum)) 
+
+# Combine
+veg.ba.sum <- env %>% 
+  left_join(herb.sum, by="plot.code") %>% 
+  left_join(ba.sum.shrub, by="plot.code") %>% 
+  left_join(ba.log.sum.tree, by="plot.code") %>% 
+  left_join(ba.sum.tree, by="plot.code") %>% 
+  left_join(ba.sum.dead, by="plot.code")
+
+veg.ba.sum[is.na(veg.ba.sum)] <- 0 # for plot with no woody vegetation
+```
+
+##### Understory Vegetation
+
+```{r}
+# Hypotheses
+herb.h1 <- lmer(herb.sum~ppt + (1|transect), data=veg.ba.sum)
+herb.h2 <- lmer(herb.sum~elevation + (1|transect), data=veg.ba.sum)
+herb.h3 <- lmer(herb.sum~avg.pH + (1|transect), data=veg.ba.sum)
+herb.h4 <- lmer(herb.sum~ppt + elevation + (1|transect), data=veg.ba.sum)
+herb.h5 <- lmer(herb.sum~ppt + avg.pH + (1|transect), data=veg.ba.sum)
+herb.h6 <- lmer(herb.sum~avg.pH + elevation + (1|transect), data=veg.ba.sum)
+herb.h7 <- lmer(herb.sum~ppt + elevation + avg.pH + (1|transect), data=veg.ba.sum)
+
+AIC(herb.h1, herb.h2, herb.h3, herb.h4, herb.h5, herb.h6, herb.h7)
+Anova(herb.h7)
+```
+
+##### Shrubs
+
+```{r}
+# Hypotheses
+shrub.h1 <- lmer(shrub.ba~ppt + (1|transect), data=veg.ba.sum)
+shrub.h2 <- lmer(shrub.ba~elevation + (1|transect), data=veg.ba.sum)
+shrub.h3 <- lmer(shrub.ba~avg.pH + (1|transect), data=veg.ba.sum)
+shrub.h4 <- lmer(shrub.ba~ppt + elevation + (1|transect), data=veg.ba.sum)
+shrub.h5 <- lmer(shrub.ba~ppt + avg.pH + (1|transect), data=veg.ba.sum)
+shrub.h6 <- lmer(shrub.ba~avg.pH + elevation + (1|transect), data=veg.ba.sum)
+shrub.h7 <- lmer(shrub.ba~ppt + elevation + avg.pH + (1|transect), data=veg.ba.sum)
+
+AIC(shrub.h1, shrub.h2, shrub.h3, shrub.h4, shrub.h5, shrub.h6, shrub.h7)
+Anova(shrub.h7)
+```
+
+##### Trees
+
+```{r}
+# Two step model
+# Step 1: presence-absence 
+pa.h1 <- glm(tree.pres~elevation,  family=binomial(link="logit"), data=veg.ba.sum)
+pa.h2 <- glm(tree.pres~ppt,  family=binomial(link="logit"), data=veg.ba.sum)
+pa.h3 <- glm(tree.pres~avg.pH,  family=binomial(link="logit"), data=veg.ba.sum)
+pa.h4 <- glm(tree.pres~ppt + elevation,  family=binomial(link="logit"), data=veg.ba.sum)
+pa.h5 <- glm(tree.pres~ppt + avg.pH,  family=binomial(link="logit"), data=veg.ba.sum)
+pa.h6 <- glm(tree.pres~elevation + avg.pH,  family=binomial(link="logit"), data=veg.ba.sum)
+pa.h7 <- glm(tree.pres~ppt + elevation + avg.pH,  family=binomial(link="logit"), data=veg.ba.sum)
+
+AIC(pa.h1, pa.h2, pa.h3, pa.h4, pa.h5, pa.h6, pa.h7)
+Anova(pa.h2)
+
+# Step 2: plots with 0 tree ba removed
+# Hypotheses
+tree.h1 <- lmer(tree.log.ba~ppt + (1|transect), data=veg.ba.sum %>% filter(tree.pres==1))
+tree.h2 <- lmer(tree.log.ba~elevation + (1|transect), data=veg.ba.sum %>% filter(tree.pres==1))
+tree.h3 <- lmer(tree.log.ba~avg.pH + (1|transect), data=veg.ba.sum %>% filter(tree.pres==1))
+tree.h4 <- lmer(tree.log.ba~ppt + elevation + (1|transect), data=veg.ba.sum %>% filter(tree.pres==1))
+tree.h5 <- lmer(tree.log.ba~ppt + avg.pH + (1|transect), data=veg.ba.sum %>% filter(tree.pres==1))
+tree.h6 <- lmer(tree.log.ba~avg.pH + elevation + (1|transect), data=veg.ba.sum %>% filter(tree.pres==1))
+tree.h7 <- lmer(tree.log.ba~ppt + elevation + avg.pH + (1|transect), data=veg.ba.sum %>% filter(tree.pres==1))
+
+AIC(tree.h1, tree.h2, tree.h3, tree.h4, tree.h5, tree.h6, tree.h7)
+Anova(tree.h6)
+```
+
+
+### Multidimensional Scaling (MDS) 
+
+##### Trees and Shrubs
+
+```{r}
+# Relativize basal area
+pcq.matrix.rel <- decostand(ba.matrix, method = "total")
+
+# Calculate Bray-Curtis Dissimilarity  
+pcq.matrix.dist <- vegdist(pcq.matrix.rel, method = "bray")
+
+# Run MDS
+pcq.mds <- metaMDS(pcq.matrix.dist, distance = "bray", trymax=1000)
+
+# Assess goodness of fit with Shepard Diagram
+stressplot(pcq.mds)
+
+# Extract MDS axis values 
+pcq.mds.scores <-  as.data.frame(pcq.mds$points)
+
+pcq.mds.scores.plot <- pcq.mds.scores %>% 
+  rownames_to_column(var="plot.code") %>% 
+  left_join(env, by="plot.code")
+
+```
+
+##### Understory Vegetation
+
+```{r}
+# Relativize percent cover
+cov.matrix.rel <- decostand(cov.matrix, method = "total")
+
+# Calculate Bray-Curtis Dissimilarity 
+cov.matrix.dist <- vegdist(cov.matrix.rel, method = "bray")
+
+# Run MDS
+cov.mds <- metaMDS(cov.matrix.dist, distance = "bray", trymax=1000)
+
+# Assess goodness of fit with Shepard Diagram
+stressplot(cov.mds)
+
+# Extract MDS axis values 
+cov.mds.scores <-  as.data.frame(cov.mds$points)
+
+cov.mds.scores.plot <- cov.mds.scores %>% 
+  rownames_to_column(var="plot.code") %>% 
+  left_join(env, by="plot.code")
+```
+
+##### Fungi 
+
+```{r}
+# Relativize read abundance 
+fun.matrix.rel <- decostand(fun.matrix, method = "total")
+
+# Calculate Bray-Curtis Dissimilarity 
+fun.matrix.dist <- vegdist(fun.matrix.rel, method = "bray")
+
+# Run MDS
+set.seed(1)
+fun.mds <- metaMDS(fun.matrix.dist, distance = "bray", trymax=1000)
+
+# Assess goodness of fit with Shepard Diagram
+stressplot(fun.mds)
+
+# Extract MDS axis values 
+fun.mds.scores <-  as.data.frame(fun.mds$points)
+
+fun.mds.scores.plot <- fun.mds.scores %>% 
+  rownames_to_column(var="plot.code") %>% 
+  left_join(env, by="plot.code")
+```
+
+##### Bacteria
+
+```{r}
+# Relativize read abundance 
+bac.matrix.rel <- decostand(bac.matrix, method = "total")
+
+# Calculate Bray-Curtis Dissimilarity 
+bac.matrix.dist <- vegdist(bac.matrix.rel, method = "bray")
+
+# Run MDS
+bac.mds <- metaMDS(bac.matrix.dist, distance = "bray", trymax=1000)
+
+# Assess goodness of fit with Shepard Diagram
+stressplot(bac.mds)
+
+# Extract MDS axis values 
+bac.mds.scores <-  as.data.frame(bac.mds$points)
+
+bac.mds.scores.plot <- bac.mds.scores %>% 
+  rownames_to_column(var="plot.code") %>% 
+  left_join(env, by="plot.code")
+```
+
+##### FIGURE 1B: NMDS Ordination Plots
+
+```{r}
+shapes <- c(21, 24, 22)
+shading <- c(0.2, 0.4, 1)
+
+cov.nmds <- ggplot(cov.mds.scores.plot, aes(x=MDS1, y=MDS2)) + 
+  geom_point(aes(alpha=transect, shape=transect, fill="Understory"), size=4) + 
+  geom_point(aes(shape=transect), size=4, color="black") + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  scale_shape_manual(values=shapes) +
+  scale_alpha_manual(values=shading) + 
+  stat_ellipse(aes(alpha=transect, color="Understory")) + 
+  theme_classic() + 
+  theme(legend.position="NONE") + 
+  ggtitle("Understory") + 
+  geom_label(aes(x = 1.5, y = 1.2, label = "R2: 0.162\nP-value: 0.019"), size=2.5)
+
+pcq.nmds <- ggplot(pcq.mds.scores.plot, aes(x=MDS1, y=MDS2)) + 
+  geom_point(aes(alpha=transect, shape=transect, fill="Woody Vegetation"), size=4) + 
+  geom_point(aes(shape=transect), size=4, color="black") + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  scale_shape_manual(values=shapes) + 
+  scale_alpha_manual(values=shading) + 
+  stat_ellipse(aes(alpha=transect, color="Woody Vegetation")) + 
+  theme_classic() + 
+  theme(legend.position="NONE") + 
+  ggtitle("Woody Vegetation") + 
+  geom_label(aes(x = 2.25, y = 2, label = "R2: 0.175\nP-value: 0.02"), size=2.5)
+
+fun.nmds <- ggplot(fun.mds.scores.plot, aes(x=MDS1, y=MDS2)) + 
+  geom_point(aes(alpha=transect, shape=transect, fill="Fungal"), size=4) + 
+  geom_point(aes(shape=transect), size=4, color="black") + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  scale_shape_manual(values=shapes) + 
+  scale_alpha_manual(values=shading) + 
+  stat_ellipse(aes(alpha=transect, color="Fungal")) + 
+  theme_classic() + 
+  theme(legend.position="NONE") + 
+  ggtitle("Fungi") + 
+  geom_label(aes(x = 1.5, y = 1.25, label = "R2: 0.154\nP-value: 0.001"), size=2.5)
+
+bac.nmds <- ggplot(bac.mds.scores.plot, aes(x=MDS1, y=MDS2)) + 
+  geom_point(aes(alpha=transect, shape=transect, fill="Bacterial"), size=4) + 
+  geom_point(aes(shape=transect), size=4, color="black") + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  scale_shape_manual(values=shapes) + 
+  scale_alpha_manual(values=shading) + 
+  stat_ellipse(aes(alpha=transect, color="Bacterial")) + 
+  theme_classic() + 
+  theme(legend.position="NONE") + 
+  ggtitle("Bacteria") + 
+  geom_label(aes(x = 2, y = 0.9, label = "R2: 0.187\nP-value: 0.002"), size=2.5)
+
+# create common legend #
+for.nmds.leg <- ggplot(pcq.mds.scores.plot, aes(x=MDS1, y=MDS2)) + 
+  geom_point(aes(alpha=transect, shape=transect), size=5) + 
+  stat_ellipse(aes(alpha=transect)) + 
+  theme_classic() + 
+  theme(legend.position="bottom")
+
+# extract and view legend #
+nmds.leg <- get_legend(for.nmds.leg)
+as_ggplot(nmds.leg)
+
+# arrange plots and save #
+ggpubr::ggarrange(cov.nmds, pcq.nmds, fun.nmds, bac.nmds, nrow=2, ncol=2, legend.grob=nmds.leg, legend="bottom", labels=c("B","C","D","E"))
+ggsave("Figure 1B NMDS.png", width = 6, height = 6, dpi=600)
+
+```
+
+### Diversity 
+
+##### Trees and Shrubs
+
+```{r}
+# Create diversity data frame
+pcq.div <- env %>% 
+  arrange(plot.code) %>% 
+  subset(plot.code!="PAM01") # no trees or shrubs present in this plot
+
+# Calculate Shannon Diversity 
+pcq.div$shannon <- diversity(ba.matrix, index="shannon")
+
+# Calculate Richness
+pcq.div$richness <- specnumber(ba.matrix)
+
+# Hypotheses 
+pcq.h1 <- lm(richness~ppt, pcq.div)
+pcq.h2 <- lm(richness~elevation, pcq.div)
+pcq.h3 <- lm(richness~avg.pH, pcq.div)
+pcq.h4 <- lm(richness~ppt * elevation, pcq.div)
+pcq.h5 <- lm(richness~avg.pH + elevation, pcq.div)
+pcq.h6 <- lm(richness~ppt + avg.pH, pcq.div)
+pcq.h7 <- lm(richness~ppt * elevation * avg.pH, pcq.div)
+
+AIC(pcq.h1, pcq.h2, pcq.h3, pcq.h4, pcq.h5, pcq.h6, pcq.h7)
+Anova(pcq.h3)
+```
+
+##### Understory Vegetation
+
+```{r}
+# Create diversity data frame
+cov.div <- env %>% 
+  arrange(plot.code)
+
+# Calculate Shannon Diversity 
+cov.div$shannon <- diversity(cov.matrix, index="shannon")
+
+# Calculate Richness
+cov.div$richness <- specnumber(cov.matrix)
+
+# Hypotheses 
+cov.h1 <- lm(richness~ppt, cov.div)
+cov.h2 <- lm(richness~elevation, cov.div)
+cov.h3 <- lm(richness~avg.pH, cov.div)
+cov.h4 <- lm(richness~ppt + elevation, cov.div)
+cov.h5 <- lm(richness~avg.pH + elevation, cov.div)
+cov.h6 <- lm(richness~ppt + avg.pH, cov.div)
+cov.h7 <- lm(richness~ppt + elevation + avg.pH, cov.div)
+
+AIC(cov.h1, cov.h2, cov.h3, cov.h4, cov.h5, cov.h6, cov.h7)
+Anova(cov.h3)
+```
+
+##### Fungi
+
+```{r}
+# Create diversity data frame
+fun.div <- env %>% 
+  arrange(plot.code)
+
+# Calculate Shannon Diversity 
+fun.div$shannon <- diversity(fun.matrix, index="shannon")
+
+# Calculate Richness
+fun.div$richness <- specnumber(fun.matrix)
+
+# Hypotheses
+```
+
+##### Bacteria
+
+```{r}
+# Create diversity data frame
+bac.div <- env %>% 
+  arrange(plot.code)
+
+# Calculate Shannon Diversity 
+bac.div$shannon <- diversity(bac.matrix, index="shannon")
+
+# Calculate Richness
+bac.div$richness <- specnumber(bac.matrix)
+
+# Hypotheses
+
+```
+
+##### FIGURE 3: Richness
+
+```{r}
+cov.div.pH <- ggplot(data=cov.div, aes(x=avg.pH, y=richness, color="Understory", fill="Understory")) + theme_classic() +
+  geom_point(size=3) + 
+  #geom_smooth(aes(color="Understory"), fullrange=TRUE, se=FALSE,
+             # method="lm", linewidth=0.5) + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  geom_smooth(fullrange=TRUE, se=TRUE,
+              method="lm", linewidth=0.5, linetype="dashed") + 
+  xlab("pH") +
+  ggtitle(bquote(bold('A ') ~ 'Understory')) +
+  theme(legend.position="NONE", 
+        axis.title.y = element_blank()) + 
+  geom_label(aes(x = 5.8, y = 11.5, label = "P=0.090\nR2=0.07"), color="black", fill="white", size=3)
+
+pcq.div.pH <- ggplot(data=pcq.div, aes(x=avg.pH, y=richness, color="Woody Vegetation", fill="Woody Vegetation")) + 
+  theme_classic() +
+  geom_point(size=3) + 
+  geom_smooth(fullrange=TRUE, se=TRUE,
+              method="lm", linewidth=0.5) + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  xlab("pH") +
+  ggtitle(bquote(bold('B ') ~ 'Woody Vegetation')) +
+  theme(legend.position="NONE", 
+        axis.title.y = element_blank()) + 
+  geom_label(aes(x = 5.8, y = 5.5, label = "P=0.007\nR2=0.22"), color="black", fill="white", size=3)
+
+bac.div.pH <- ggplot(data=bac.div, aes(x=avg.pH, y=richness, color="Bacterial", fill="Bacterial")) + theme_classic() +
+  geom_point(size=3,) + 
+  geom_smooth(fullrange=TRUE, se=TRUE,
+              method="lm", linewidth=0.5) + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  xlab("pH") +
+  ggtitle(bquote(bold('D ') ~ 'Bacterial')) +
+  theme(legend.position="NONE", 
+        axis.title.y = element_blank()) + 
+  geom_label(aes(x = 5.8, y = 2575, label = "P=0.034\nR2=0.13"), color="black", fill="white", size=3)
+
+fun.div.ppt <- ggplot(data=fun.div, aes(x=ppt, y=richness, color="Fungal", fill="Fungal")) + 
+  theme_classic() +
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  geom_point(size=3) + 
+  geom_smooth(fullrange=TRUE, se=TRUE,
+              method="lm", linewidth=0.5, linetype="dashed") + 
+  xlab("Soil salinity (ppt)") +
+  ggtitle(bquote(bold('C ') ~ 'Fungal')) +
+  theme(legend.position="NONE", 
+        axis.title.y = element_blank()) + 
+  geom_label(aes(x = 11.75, y = 630, label = "P=0.445\nR2=-0.02"), color="black", fill="white", size=3)
+
+fig3 <- ggarrange(cov.div.pH, pcq.div.pH, fun.div.ppt, bac.div.pH, nrow=2, ncol=2)
+
+ggsave("Figure 3 Richness.png", plot=fig3, width = 6, height = 5, dpi=600)
+```
+
+
+### Testing SWISLR Variable Colinearity
+
+```{r}
+# Variance inflation factor 
+# Vegetation abundance models
+vif(herb.h7)
+vif(shrub.h7)
+vif(tree.h7)
+
+# Richness models
+vif(lm(richness ~ ppt + avg.pH + elevation, data=pcq.div))
+vif(lm(richness ~ ppt + avg.pH + elevation, data=cov.div))
+vif(lm(richness ~ ppt + avg.pH + elevation, data=fun.div))
+vif(lm(richness ~ ppt + avg.pH + elevation, data=bac.div))
+
+# Variable correlation
+cor(env$ppt, env$elevation) # -0.04868284
+cor(env$elevation, env$avg.pH) # -0.2480433
+cor(env$ppt, env$avg.pH) # 0.6468339
+cor(env$elevation, env$percent.sm) # -0.5699092
+cor(env$ppt, env$percent.sm)# 0.2215169
+```
+
+
+### Microbial Phyla
+
+##### Figure 4
+
+```{r}
+
+```
+
+
+### Generalized Dissimilarity Models
+
+```{r}
+# Select relevant environmental and geographic variables to include in models
+soil.gdm <- env %>% 
+  dplyr::select(plot.code, ppt, avg.pH, elevation)
+
+site.gdm <- env %>% 
+  dplyr::select(plot.code, latitude, longitude) %>% 
+  arrange(plot.code)
+```
+
+##### Trees and Shrubs
+
+```{r}
+# Join environmental data with pcq data in long format
+pcq.xy <- ba.sum %>% 
+  left_join(site.gdm, by="plot.code") %>% 
+  left_join(soil.gdm, by="plot.code")
+
+# Select species data
+pcq.sppTab <- pcq.xy %>%
+  dplyr::select(plot.code, longitude, latitude, species, ba.sum)
+
+# Select environmental data
+pcq.envTab <- pcq.xy %>%
+  dplyr::select(plot.code, ppt, avg.pH, elevation)
+
+pcq.xy$species <- as.factor(pcq.xy$species)
+pcq.xy$plot.code <- as.factor(pcq.xy$plot.code)
+
+
+# Format site pairs for GDM
+pcq.gdmTab <- gdm::formatsitepair(bioData=pcq.sppTab, bioFormat=2, abundance=TRUE, dist="bray", 
+                         siteColumn="plot.code", XColumn="longitude", YColumn="latitude", 
+                         sppColumn="species", abundColumn="ba.sum", predData=pcq.envTab)
+
+# Run GDM
+set.seed(1)
+pcq.gdm <- gdm(pcq.gdmTab, geo=TRUE)
+
+# Model results summary
+summary(pcq.gdm)
+
+# Quantify predictor importance 
+set.seed(1)
+gdm.varImp(pcq.gdmTab, geo=TRUE)
+
+# Extract model iSplines for plotting
+pcq.splines <- as.data.frame(isplineExtract(pcq.gdm))
+
+# Identify positions of steepest slope
+pcq.slopes <- pcq.splines %>% 
+  mutate(ppt.slope = (y.ppt - lag(y.ppt)) / (x.ppt - lag(x.ppt))) %>% 
+  mutate(pH.slope = (y.avg.pH - lag(y.avg.pH)) / (x.avg.pH - lag(x.avg.pH))) %>% 
+  mutate(elev.slope = (y.elevation - lag(y.elevation)) / (x.elevation - lag(x.elevation)))
+
+# Visually assess
+pcq.slopes
+```
+
+##### Understory
+
+```{r}
+# Join environmental data with cover data in long format
+cov.xy <- cover %>% 
+  left_join(site.gdm, by="plot.code") %>% 
+  left_join(soil.gdm, by="plot.code") %>% 
+  mutate(species = as.factor(species)) %>% 
+  mutate(plot.code = as.factor(plot.code)) %>% 
+  mutate(percent.cover = replace(percent.cover, percent.cover == "<1", "0.5")) %>% 
+  mutate(percent.cover = as.numeric(percent.cover))
+
+# Select species data
+cov.sppTab <- cov.xy %>% 
+  dplyr::select(plot.code, longitude, latitude, species, percent.cover)
+
+# Select environmental data
+cov.envTab <- cov.xy %>% 
+  dplyr::select(plot.code, ppt, avg.pH, elevation)
+
+# Format site pairs for GDM
+cov.gdmTab <- gdm::formatsitepair(bioData=cov.sppTab, bioFormat=2, abundance=TRUE, dist="bray", 
+                         siteColumn="plot.code", XColumn="longitude", YColumn="latitude", 
+                         sppColumn="species", abundColumn="percent.cover", predData=cov.envTab)
+
+# Run GDM
+set.seed(1)
+cov.gdm <- gdm(cov.gdmTab, geo=TRUE)
+
+# Model results summary
+summary(cov.gdm)
+
+# Quantify predictor importance 
+set.seed(1)
+gdm.varImp(cov.gdmTab, geo=TRUE)
+
+# Extract model iSplines for plotting
+cov.splines <- as.data.frame(isplineExtract(cov.gdm))
+
+# Identify positions of steepest slope
+cov.slopes <- cov.splines %>% 
+  mutate(ppt.slope = (y.ppt - lag(y.ppt)) / (x.ppt - lag(x.ppt))) %>% 
+  mutate(pH.slope = (y.avg.pH - lag(y.avg.pH)) / (x.avg.pH - lag(x.avg.pH))) %>% 
+  mutate(elev.slope = (y.elevation - lag(y.elevation)) / (x.elevation - lag(x.elevation)))
+
+# Visually assess
+cov.slopes
+```
+
+##### Fungi 
+
+```{r}
+## Create xy df of otu data ##
+fun.xy <- fun.otu %>% 
+  select(-c(X)) %>% 
+  left_join(site.gdm, by="plot.code") %>% 
+  left_join(soil.gdm, by="plot.code") %>% 
+  gather(otu, n, 2:4410) %>% 
+  mutate(otu = as.factor(otu)) %>% 
+  mutate(plot.code = as.factor(plot.code))  
+
+## Subset bio data ##
+fun.sppTab <- fun.xy %>% 
+  dplyr::select(plot.code, longitude, latitude, otu, n)
+
+## Subset pred data ##
+fun.envTab <- fun.xy %>% 
+  dplyr::select(plot.code, ppt, avg.pH, elevation)
+
+## Format site pair for GDM
+fun.gdmTab <- formatsitepair(bioData=fun.sppTab, bioFormat=2, abundance=TRUE, dist="bray", 
+                             siteColumn="plot.code", XColumn="longitude", YColumn="latitude", 
+                             sppColumn="otu", abundColumn="n", predData=fun.envTab)
+
+# Run GDM
+set.seed(1)
+fun.gdm <- gdm(fun.gdmTab, geo=TRUE)
+
+# Model results summary
+summary(fun.gdm)
+
+# Quantify predictor importance 
+set.seed(4)
+gdm.varImp(fun.gdmTab, geo=TRUE)
+
+# Extract model iSplines for plotting
+fun.splines <- as.data.frame(isplineExtract(fun.gdm))
+
+# Identify positions of steepest slope
+fun.slopes <- fun.splines %>% 
+  mutate(ppt.slope = (y.ppt - lag(y.ppt)) / (x.ppt - lag(x.ppt))) %>% 
+  mutate(pH.slope = (y.avg.pH - lag(y.avg.pH)) / (x.avg.pH - lag(x.avg.pH))) %>% 
+  mutate(elev.slope = (y.elevation - lag(y.elevation)) / (x.elevation - lag(x.elevation)))
+
+# Assess
+fun.slopes
+```
+
+##### Bacteria
+
+```{r}
+## Create xy df of otu data ##
+bac.xy <- site.gdm %>% 
+  left_join(bac.otu, by="plot.code") %>%
+  gather(otu, n, 4:11498)
+
+## Join xy with selected soil data ##
+bac.xy.all <- bac.xy %>% 
+  left_join(soil.gdm, by="plot.code")
+  
+## Correct column formats ##
+bac.xy.all$species <- as.factor(bac.xy.all$otu)
+bac.xy.all$plot.code <- as.factor(bac.xy.all$plot.code)
+
+## subset bioData ##
+bac.sppTab <- bac.xy.all %>% 
+  dplyr::select(plot.code, longitude, latitude, otu, n)
+
+## subset predData ##
+bac.envTab <- bac.xy.all %>% 
+  dplyr::select(plot.code, ppt, avg.pH, elevation)
+
+## format site pair for GDM
+bac.gdmTab <- formatsitepair(bioData=bac.sppTab, bioFormat=2, abundance=TRUE, dist="bray", 
+                             siteColumn="plot.code", XColumn="longitude", YColumn="latitude", 
+                             sppColumn="otu", abundColumn="n", predData=bac.envTab)
+
+# Run GDM
+set.seed(1)
+bac.gdm <- gdm(bac.gdmTab, geo=TRUE)
+
+# Model results summary
+summary(bac.gdm)
+
+# Quantify predictor importance 
+set.seed(1)
+gdm.varImp(bac.gdmTab, geo=TRUE)
+
+# Extract model iSplines for plotting
+bac.splines <- as.data.frame(isplineExtract(bac.gdm))
+
+# Identify positions of steepest slope
+bac.slopes <- bac.splines %>% 
+  mutate(ppt.slope = (y.ppt - lag(y.ppt)) / (x.ppt - lag(x.ppt))) %>% 
+  mutate(pH.slope = (y.avg.pH - lag(y.avg.pH)) / (x.avg.pH - lag(x.avg.pH))) %>% 
+  mutate(elev.slope = (y.elevation - lag(y.elevation)) / (x.elevation - lag(x.elevation)))
+
+# Assess
+bac.slopes
+```
+
+```{r}
+## FIGURE 2: Generalized Dissimilarity Model Splines ## 
+
+salt.iS <- ggplot() + 
+  geom_line(data=cov.splines, aes(x=x.ppt, y=y.ppt, color="Understory"), linewidth=1.5, linetype="dashed") + 
+  geom_vline(aes(xintercept=0.05, color="Understory")) + 
+  geom_vline(aes(xintercept=0.1, color="Woody Vegetation")) +
+  geom_vline(aes(xintercept=0.15, color="Bacterial")) + 
+  geom_vline(aes(xintercept=0.2, color="Fungal")) + 
+  geom_line(data=pcq.splines, aes(x=x.ppt, y=y.ppt, color="Woody Vegetation"), linewidth=1.5) + 
+  geom_line(data=bac.splines, aes(x=x.ppt, y=y.ppt, color="Bacterial"), linewidth=1.5) +
+  geom_line(data=fun.splines, aes(x=x.ppt, y=y.ppt, color="Fungal"), linewidth=1.5) + 
+  ylab("Ecological distance") + 
+  xlab("Soil salinity (ppt)") + 
+  theme_classic() + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", linewidth=1), 
+        legend.position = "NONE")  + 
+  ylim(0,3.4) + 
+  ggtitle("") + 
+  scale_color_manual(values=color)
+
+pH.iS <- ggplot() + 
+  geom_vline(aes(xintercept=6.08, color="Understory")) + 
+  geom_vline(aes(xintercept=6.09, color="Woody Vegetation")) +
+  geom_vline(aes(xintercept=3.79, color="Bacterial")) + 
+  geom_vline(aes(xintercept=4.53, color="Fungal")) + 
+  geom_line(data=cov.splines, aes(x=x.avg.pH, y=y.avg.pH, color="Understory"), linewidth=1.5) + 
+  geom_line(data=pcq.splines, aes(x=x.avg.pH, y=y.avg.pH, color="Woody Vegetation"), linewidth=1.5, linetype="dashed") + 
+  geom_line(data=bac.splines, aes(x=x.avg.pH, y=y.avg.pH, color="Bacterial"), linewidth=1.5) +
+  geom_line(data=fun.splines, aes(x=x.avg.pH, y=y.avg.pH, color="Fungal"), linewidth=1.5) + 
+   xlab("pH") + theme_classic() + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", linewidth=1),
+        axis.title.y=element_blank(), 
+        legend.position = "NONE") + 
+  ylim(0,3.4) + 
+  ggtitle("") + 
+ scale_color_manual(values=color)
+
+elev.iS <- ggplot() + 
+  geom_vline(aes(xintercept=0.698, color="Understory")) + 
+  geom_vline(aes(xintercept=0.203, color="Woody Vegetation")) +
+  geom_vline(aes(xintercept=0.699, color="Bacterial")) + 
+  geom_vline(aes(xintercept=0.70, color="Fungal")) + 
+  geom_line(data=cov.splines, aes(x=x.elevation, y=y.elevation, color="Understory"), linewidth=1.5, linetype="dashed") + 
+  geom_line(data=pcq.splines, aes(x=x.elevation, y=y.elevation, color="Woody Vegetation"), linewidth=1.5, linetype="dashed") + 
+  geom_line(data=bac.splines, aes(x=x.elevation, y=y.elevation, color="Bacterial"), linewidth=1.5, linetype="dashed") +
+  geom_line(data=fun.splines, aes(x=x.elevation, y=y.elevation, color="Fungal"), linewidth=1.5, linetype="dashed") + 
+  xlab("Elevation (m)") + 
+  theme_classic() + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", linewidth=1),
+        axis.title.y=element_blank(), 
+        legend.position = "NONE")  + 
+  ylim(0,3.4) + 
+   ggtitle("") + 
+  scale_color_manual(values=color)
+ 
+geo.iS <- ggplot() + 
+   geom_line(data=cov.splines, aes(x=x.Geographic, y=y.Geographic, color="Understory"), linewidth=1.5) + 
+   geom_line(data=pcq.splines, aes(x=x.Geographic, y=y.Geographic, color="Woody Vegetation"), linewidth=1.5) + 
+   geom_line(data=bac.splines, aes(x=x.Geographic, y=y.Geographic, color="Bacterial"), linewidth=1.5) +
+   geom_line(data=fun.splines, aes(x=x.Geographic, y=y.Geographic, color="Fungal"), linewidth=1.5) + 
+   xlab("Geographic Distance (DD)") + theme_classic() + 
+   theme(panel.grid.major = element_blank(), 
+         panel.grid.minor = element_blank(),
+         panel.background = element_rect(colour = "black", linewidth=1),
+         axis.title.y=element_blank()) + 
+  ylim(0,3.4) + 
+  ggtitle("") + 
+   scale_color_manual(values=color)
+
+fig2 <- ggpubr::ggarrange(salt.iS, pH.iS, elev.iS, geo.iS, nrow=1, common.legend=TRUE, legend="bottom", labels=c("A","B","C","D"))
+
+ggsave("Figure 2 GDMs.png", plot=fig2, width =9, height = 3, dpi=600)
+```
+
+### Mantel Tests for Matrix Correlation
+
+```{r}
+# Understory x woody vegetation
+# Remove PAM 1 - no PCQ data for plot
+cov.matrix.PAM1 <- cov.matrix %>% 
+  rownames_to_column(var="plot.code") %>%
+  filter(plot.code!="PAM01") %>% 
+  arrange(plot.code) %>% 
+  dplyr::select(-c(plot.code))
+
+# Calculate relative abundance
+cov.matrix.rel.PAM1 <- decostand(cov.matrix.PAM1, method = "total")
+
+# Calculate dissimilarity matrix
+cov.matrix.dist.PAM1 <- vegdist(cov.matrix.rel.PAM1, method = "bray")
+
+# Format pcq matrix to remove rownames
+pcq.matrix.PAM1 <- ba.matrix %>% 
+  rownames_to_column(var="plot.code") %>%
+  arrange(plot.code) %>% 
+  dplyr::select(-c(plot.code))
+
+# Calculate relative abundance
+pcq.matrix.rel.PAM1 <- decostand(pcq.matrix.PAM1, method = "total")
+
+# Calculate dissimilarity matrix
+pcq.matrix.dist.PAM1 <- vegdist(pcq.matrix.rel.PAM1, method = "bray")
+
+
+cov.pcq.mantel = mantel(cov.matrix.dist.PAM1, pcq.matrix.dist.PAM1, method = "spearman", permutations = 9999, na.rm = TRUE)
+
+cov.pcq.mantel
+# Mantel statistic r: 0.2335 
+# Significance: 0.0019
+
+# Fungi x understory
+cov.fun.mantel = mantel(fun.matrix.dist, cov.matrix.dist, method = "spearman", permutations = 9999, na.rm = TRUE)
+
+cov.fun.mantel
+# Mantel statistic r: 0.4774 
+# Significance: 1e-04
+
+# Fungi x woody vegetation
+# Remove PAM 1 - no PCQ data for plot
+fun.otu.field.PAM1 <- fun.otu %>% 
+  select(-c("X")) %>% 
+  subset(plot.code!="PAM01") %>%
+  arrange(plot.code) %>% 
+  dplyr::select(-c(1:2))
+
+# Calculate relative abundance
+fun.matrix.rel.PAM1 <- decostand(fun.otu.field.PAM1, method = "total")
+
+# Calculate dissimilarity matrix
+fun.matrix.dist.PAM1 <- vegdist(fun.matrix.rel.PAM1, method = "bray")
+
+pcq.fun.mantel = mantel(fun.matrix.dist.PAM1, pcq.matrix.dist.PAM1, method = "spearman", permutations = 9999, na.rm = TRUE)
+
+pcq.fun.mantel
+# Mantel statistic r: 0.1563 
+# Significance: 0.0195 
+
+# Bacteria x understory
+cov.bac.mantel = mantel(bac.matrix.dist, cov.matrix.dist, method = "spearman", permutations = 9999, na.rm = TRUE)
+
+cov.bac.mantel
+# Mantel statistic r: 0.5715 
+# Significance: 1e-04 
+
+# Bacteria x woody vegetation
+bac.otu.field.PAM1 <- bac.otu %>% 
+  subset(plot.code!="PAM01") %>%
+  arrange(plot.code) %>% 
+  dplyr::select(-c(1:8))
+
+## calculate relative abundance ##
+bac.matrix.rel.PAM1 <- decostand(bac.otu.field.PAM1, method = "total")
+
+## calculate dissimilarity matrix ##
+bac.matrix.dist.PAM1 <- vegdist(bac.matrix.rel.PAM1, method = "bray")
+
+pcq.bac.mantel = mantel(bac.matrix.dist.PAM1, pcq.matrix.dist.PAM1, method = "spearman", permutations = 9999, na.rm = TRUE)
+
+pcq.bac.mantel
+# Mantel statistic r: 0.1796 
+# Significance: 0.0144
+
+## Fungi x bacteria
+bac.fun.mantel = mantel(bac.matrix.dist, fun.matrix.dist, method = "spearman", permutations = 9999, na.rm = TRUE)
+bac.fun.mantel
+# Mantel statistic r: 0.747 
+# Significance: 1e-04 
+```
+
+##### FIGURE 5: Plotting Distance Matrices
+
+```{r}
+# create lists of distance value for each row/col combination (except Woody Vegetation) #
+bac.dist.list <- bac.matrix.dist %>% 
+  as.matrix() %>% 
+  melt(varnames = c("row", "col")) %>% 
+  filter(value!=0)
+
+cov.dist.list <- cov.matrix.dist %>% 
+  as.matrix() %>% 
+  melt(varnames = c("row", "col")) %>% 
+  subset(value!=0)
+
+fun.dist.list <- fun.matrix.dist %>% 
+  as.matrix() %>% 
+  melt(varnames = c("row", "col")) %>% 
+  subset(value!=0)
+
+# combine lists #
+bac.cov.dist.list <- left_join(bac.dist.list, cov.dist.list, by=c("row","col"))
+fun.cov.dist.list <- left_join(fun.dist.list, cov.dist.list, by=c("row","col"))
+
+# make separate lists for correlating with woody vegetation (PAM01 omitted) #
+# PAM01 was formerly labeled PAM06 #
+
+bac.dist.list.PAM1 <- bac.matrix.dist.PAM1 %>% 
+  as.matrix() %>% 
+  melt(varnames = c("row", "col")) %>% 
+  subset(value!=0)
+
+fun.dist.list.PAM1 <- fun.matrix.dist.PAM1 %>% 
+  as.matrix() %>% 
+  melt(varnames = c("row", "col")) %>% 
+  subset(value!=0)
+
+pcq.dist.list <- pcq.matrix.dist.PAM1 %>% 
+  as.matrix() %>% 
+  melt(varnames = c("row", "col")) %>% 
+  subset(value!=0)
+
+cov.dist.list.PAM1 <- cov.matrix.dist.PAM1 %>% 
+  as.matrix() %>% 
+  melt(varnames = c("row", "col")) %>% 
+  subset(value!=0)
+
+# combine lists #
+bac.pcq.dist.list <- left_join(bac.dist.list.PAM1, pcq.dist.list, by=c("row","col"))
+fun.pcq.dist.list <- left_join(fun.dist.list.PAM1, pcq.dist.list, by=c("row","col"))
+cov.pcq.dist.list <- left_join(cov.dist.list.PAM1, pcq.dist.list, by=c("row","col"))
+bac.fun.dist.list <- left_join(fun.dist.list, bac.dist.list, by=c("row","col"))
+
+
+# plot distance values for each pairing #
+bac.cov.mant <- ggplot() + 
+  geom_point(data=bac.cov.dist.list, aes(x=value.y, y=value.x, fill="Understory"), size=2, shape=21, alpha=0.5) + 
+  theme_classic() + 
+  geom_smooth(data=bac.cov.dist.list, aes(x=value.y, y=value.x, fill="Understory"), color="black", fullrange=TRUE, method=lm, linewidth=0.5) + 
+  ylab("Bacterial Distance") + #xlab("Understory Distance") + 
+  geom_label(aes(x = 0.2, y = 0.2, label = "Mant stat=0.57\nP=<0.001"), size=3) + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  theme(legend.position="NONE") +
+  ggtitle("") + xlab("") + 
+  ylim(0,1) + xlim(0,1)
+
+bac.pcq.mant <- ggplot() + 
+  geom_point(data=bac.pcq.dist.list, aes(x=value.y, y=value.x, fill="Woody Vegetation"), size=2, shape=21, alpha=0.5) + 
+  theme_classic() + 
+  geom_smooth(data=bac.pcq.dist.list, aes(x=value.y, y=value.x, fill="Woody Vegetation"), color="black", fullrange=TRUE, method=lm, linewidth=0.5) + 
+  geom_label(aes(x = 0.2, y = 0.2, label = "Mant stat=0.18\nP=0.014"), size=3) + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  theme(legend.position="NONE") +
+  ggtitle("") + 
+  ylab("") + xlab("") + 
+  ylim(0,1) + xlim(0,1)
+ 
+fun.cov.mant <- ggplot() + 
+  geom_point(data=fun.cov.dist.list, aes(x=value.y, y=value.x, fill="Understory"), size=2, shape=21, alpha=0.5) + 
+  theme_classic() + 
+  geom_smooth(data=fun.cov.dist.list, aes(x=value.y, y=value.x, fill="Understory"), color="black", fullrange=TRUE, method=lm, linewidth=0.5) + 
+  ylab("Fungal Distance") + xlab(" ") + 
+  geom_label(aes(x = 0.2, y = 0.2, label = "Mant stat=0.48\nP=<0.001"), size=3) + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  theme(legend.position = "NONE") + 
+  ggtitle("") + 
+  ylim(0,1) + xlim(0,1)
+
+fun.pcq.mant <- ggplot() + 
+  geom_point(data=fun.pcq.dist.list, aes(x=value.y, y=value.x, fill="Woody Vegetation"), size=2, shape=21, alpha=0.5) + 
+  theme_classic() + 
+  geom_smooth(data=fun.pcq.dist.list, aes(x=value.y, y=value.x, fill="Woody Vegetation"), color="black", fullrange=TRUE, method=lm, linewidth=0.5) + 
+  xlab("Woody Distance") + 
+  geom_label(aes(x = 0.2, y = 0.2, label = "Mant stat=0.16\nP=0.020"), size=3) + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  theme(legend.position = "NONE") + 
+  ylab(" ") + 
+  ggtitle("") + 
+  ylim(0,1) + xlim(0,1)
+
+pcq.cov.mant <- ggplot() + 
+  geom_point(data=cov.pcq.dist.list, aes(x=value.x, y=value.y, fill="Understory"), size=2, shape=21, alpha=0.5) + 
+  theme_classic() + 
+  geom_smooth(data=cov.pcq.dist.list, aes(x=value.x, y=value.y, fill="Understory"), color="black", fullrange=TRUE, method=lm, linewidth=0.5) + 
+  ylab("Woody Distance") + xlab("Understory Distance") + 
+  geom_label(aes(x = 0.2, y = 0.2, label = "Mant stat=0.23\nP=0.002"), size=3) + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  theme(legend.position = "NONE") + 
+  ggtitle("") + 
+  ylim(0,1) + xlim(0,1)
+
+microbe.mant <- ggplot() + 
+  geom_point(data=bac.fun.dist.list, aes(x=value.x, y=value.y, fill="Fungal"), size=2, shape=21, alpha=0.5) + 
+  theme_classic() + 
+  geom_smooth(data=bac.fun.dist.list, aes(x=value.x, y=value.y, fill="Fungal"), color="black", fullrange=TRUE, method=lm, linewidth=0.5) + 
+  xlab("Fungal Distance") + 
+  ylab("Bacterial Distance") +
+  geom_label(aes(x = 0.2, y = 0.2, label = "Mant stat=0.75\nP=<0.001"), size=3) + 
+  scale_color_manual(values=color) + 
+  scale_fill_manual(values=color) + 
+  theme(legend.position = "NONE") + 
+  ggtitle("") + 
+  ylim(0,1) + xlim(0,1)
+
+fig5 <- ggpubr::ggarrange(bac.cov.mant, bac.pcq.mant, fun.cov.mant, fun.pcq.mant, pcq.cov.mant, microbe.mant, 
+                  labels=c("A","B","C","D","E","F"), nrow=3, ncol=2)
+
+ggsave("Figure 5 Mantel.png", plot=fig5, width=6, height=7, dpi=600)
+```
+
+### TITAN Analyses
+
+```{r}
+# Extract plot SWISLR driver values
+ppt.titan <- env %>% 
+  arrange(plot.code) %>%
+  select(ppt)
+
+pH.titan <- env %>% 
+  arrange(plot.code) %>%
+  select(avg.pH)
+
+elev.titan <- env %>% 
+  arrange(plot.code) %>%
+  select(elevation)
+```
+
+
+##### Fungi
+
+```{r}
+# Extract OTUs with >3 occurences
+fun.otu.pa <- decostand(fun.otu %>% arrange(plot.code) %>% select(-c(1:2)), method = "pa") 
+fun.otu.pa <- fun.otu.pa[colSums(fun.otu.pa)>3]
+fun.common_cols <- intersect(names(fun.otu.pa), names(fun.otu))
+
+fun.otu.titan <- fun.otu %>% 
+  select(all_of(fun.common_cols))
+
+# Run TITAN analyses
+set.seed(1)
+fun.ppt.titan <- titan(ppt.titan, fun.otu.titan, nBoot=1000)
+
+set.seed(1)
+fun.pH.titan <- titan(pH.titan, fun.otu.titan, nBoot=1000)
+
+set.seed(1)
+fun.elev.titan <- titan(elev.titan, fun.otu.titan, nBoot=1000)
+
+# View change point bootstrap quantiles
+fun.ppt.titan$sumz.cp
+fun.pH.titan$sumz.cp
+fun.elev.titan$sumz.cp
+
+## extract and save output ##
+fun.ppt.titan.df <- fun.ppt.titan$sppmax %>%
+  as.data.frame() %>%
+  select(zenv.cp, freq, maxgrp, IndVal, purity, reliability, filter) %>% 
+  rownames_to_column(var="OTU") %>% 
+  left_join(fun.tax, by="OTU")
+
+fun.pH.titan.df <- fun.pH.titan$sppmax %>%
+  as.data.frame() %>%
+  select(zenv.cp, freq, maxgrp, IndVal, purity, reliability, filter) %>% 
+  rownames_to_column(var="OTU") %>% 
+  left_join(fun.tax, by="OTU")
+
+fun.elev.titan.df <- fun.elev.titan$sppmax %>%
+  as.data.frame() %>%
+  select(zenv.cp, freq, maxgrp, IndVal, purity, reliability, filter) %>% 
+  rownames_to_column(var="OTU") %>% 
+  left_join(fun.tax, by="OTU")
+
+# Visualize taxa
+plot_taxa_ridges(fun.ppt.titan) 
+plot_taxa_ridges(fun.pH.titan) 
+plot_taxa_ridges(fun.elev.titan) 
+```
+
+##### Bacteria
+
+```{r}
+# Extract OTUs with >3 occurences
+bac.otu.pa <- decostand(bac.otu, method = "pa") 
+bac.otu.pa <- bac.otu.pa[colSums(bac.otu.pa)>3]
+common_cols <- intersect(names(bac.otu.pa), names(bac.otu))
+
+bac.otu.titan <- bac.otu %>% 
+  select(all_of(common_cols))
+
+# Run TITAN analyses
+set.seed(1)
+bac.ppt.titan <- titan(ppt.titan, bac.otu.titan, nBoot=1000)
+
+set.seed(1)
+bac.pH.titan <- titan(pH.titan, bac.otu.titan, nBoot=1000)
+
+set.seed(1)
+bac.elev.titan <- titan(elev.titan, bac.otu.titan, nBoot=1000)
+
+# View change point bootstrap quantiles
+bac.ppt.titan$sumz.cp
+bac.pH.titan$sumz.cp
+bac.elev.titan$sumz.cp
+
+
+# Extract and save output
+bac.ppt.titan.df <- bac.ppt.titan$sppmax %>%
+  as.data.frame() %>%
+  select(zenv.cp, freq, maxgrp, IndVal, purity, reliability, filter) %>% 
+  rownames_to_column(var="OTU") %>% 
+  left_join(bac.tax, by="OTU")
+
+bac.pH.titan.df <- bac.pH.titan$sppmax %>%
+  as.data.frame() %>%
+  select(zenv.cp, freq, maxgrp, IndVal, purity, reliability, filter) %>% 
+  rownames_to_column(var="OTU") %>% 
+  left_join(bac.tax, by="OTU")
+
+bac.elev.titan.df <- bac.elev.titan$sppmax %>%
+  as.data.frame() %>%
+  select(zenv.cp, freq, maxgrp, IndVal, purity, reliability, filter) %>% 
+  rownames_to_column(var="OTU") %>% 
+  left_join(bac.tax, by="OTU")
+
+# Visualize taxa
+plot_taxa_ridges(bac.ppt.titan) 
+plot_taxa_ridges(bac.pH.titan) 
+plot_taxa_ridges(bac.elev.titan) 
+```
+
+##### Figure 6 TITAN 
+
+```{r}
+# Fungal change point and density plots
+fun.pH.titan.plot <- plot_sumz_density(fun.pH.titan, 
+                                       sumz=FALSE, 
+                                       col1="#FF7CAC", col2="#ffbad3", 
+                                       xlabel=NULL, y2label=NULL)
+
+fun.ppt.titan.plot <- plot_sumz_density(fun.ppt.titan, 
+                                        sumz=FALSE, 
+                                        col1="#FF7CAC", col2="#ffbad3", 
+                                        xlabel=NULL, y2label=NULL)
+
+fun.elev.titan.plot <- plot_sumz_density(fun.elev.titan, 
+                                         sumz=FALSE, 
+                                         col1="#FF7CAC", col2="#ffbad3", 
+                                         xlabel=NULL, y2label=NULL)
+
+# Bacterial change point and density plots
+bac.pH.titan.plot <- plot_sumz_density(bac.pH.titan, 
+                                       sumz=FALSE, 
+                                       col1="#2949C5", col2="#758be0", 
+                                       xlabel=NULL, y2label=NULL)
+
+bac.ppt.titan.plot <- plot_sumz_density(bac.ppt.titan, 
+                                        sumz=FALSE, 
+                                        col1="#2949C5", col2="#758be0", 
+                                        xlabel=NULL, y2label=NULL)
+
+bac.elev.titan.plot <- plot_sumz_density(bac.elev.titan, 
+                                         sumz=FALSE, 
+                                         col1="#2949C5", col2="#758be0", 
+                                         xlabel=NULL, y2label=NULL)
+
+ggarrange(fun.ppt.titan.plot, fun.pH.titan.plot, fun.elev.titan.plot, 
+          bac.ppt.titan.plot, bac.pH.titan.plot, bac.elev.titan.plot, 
+          labels=c("A", "B","C","D","E","F")) 
+
+ggsave("Figure 6 TITAN.png", width = 6, height = 4, dpi=600)
+
+```
+
+### Supplemental Figures
+
+##### S Figure 1: Vegetation Abundance
+
+```{r}
+MAS.data <- veg.ba.sum %>% filter(transect=="MAS")
+PPR.data <- veg.ba.sum %>% filter(transect=="PPR")
+PAM.data <- veg.ba.sum %>% filter(transect=="PAM")
+
+MAS.under <- ggplot(MAS.data) + 
+  geom_area(aes(x=distance, y=herb.sum, fill="Understory")) +
+  theme_classic() + ylab("% cover") +  ggtitle("MAS") + 
+  scale_fill_manual(values=color) + 
+  ylim(0,100) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+PPR.under <- ggplot(PPR.data) + 
+  geom_area(aes(x=distance, y=herb.sum, fill="Understory")) +
+  theme_classic() + ylab("% cover") +  ggtitle("PPR") + 
+  scale_fill_manual(values=color) + 
+  ylim(0,100) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+PAM.under <- ggplot(PAM.data) + 
+  geom_area(aes(x=distance, y=herb.sum, fill="Understory")) +
+  theme_classic() + ylab("% cover") +  ggtitle("PAM") + 
+  ylim(0,100) + 
+  scale_fill_manual(values=color) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+MAS.shrub <- ggplot(MAS.data) + 
+  geom_area(aes(x=distance, y=shrub.ba, fill="Shrub")) +
+  theme_classic() + ylab("basal area") +
+  scale_fill_manual(values=color) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+PPR.shrub <- ggplot(PPR.data) + 
+  geom_area(aes(x=distance, y=shrub.ba, fill="Shrub")) +
+  theme_classic() + ylab("basal area") + 
+  scale_fill_manual(values=color) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+PAM.shrub <- ggplot(PAM.data) + 
+  geom_area(aes(x=distance, y=shrub.ba, fill="Shrub")) +
+  theme_classic() + ylab("basal area") + 
+  scale_fill_manual(values=color) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+MAS.tree <- ggplot(MAS.data) + 
+  geom_area(aes(x=distance, y=tree.ba, fill="Woody Vegetation")) +
+  theme_classic() + ylab("basal area") + 
+  scale_fill_manual(values=color) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+PPR.tree <- ggplot(PPR.data) + 
+  geom_area(aes(x=distance, y=tree.ba, fill="Woody Vegetation")) +
+  theme_classic() + ylab("basal area") + 
+  scale_fill_manual(values=color) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+PAM.tree <- ggplot(PAM.data) + 
+  geom_area(aes(x=distance, y=tree.ba, fill="Woody Vegetation")) +
+  theme_classic() + ylab("basal area") + 
+  scale_fill_manual(values=color) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+MAS.dead <- ggplot(MAS.data) + 
+  geom_area(aes(x=distance, y=dead.sum, fill="Dead Tree")) + 
+  theme_classic() + ylab("basal area") + 
+  scale_fill_manual(values=color) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+PPR.dead <- ggplot(PPR.data) + 
+  geom_area(aes(x=distance, y=dead.sum, fill="Dead Tree")) + 
+  theme_classic() + ylab("basal area") + 
+  scale_fill_manual(values=color) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+PAM.dead <- ggplot(PAM.data) + 
+  geom_area(aes(x=distance, y=dead.sum, fill="Dead Tree")) + 
+  theme_classic() +
+  scale_fill_manual(values=color) + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  geom_point(aes(x=distance, y=0), color="black")
+
+MAS.ppt <- ggplot(MAS.data) + 
+  geom_smooth(aes(x=distance, y=ppt), method="lm", se=FALSE, color="black", size=0.5) + 
+  geom_point(aes(x=distance, y=ppt, fill="black", alpha=0.5), size=3) + 
+  theme_classic() + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  ylim(0,13.5)
+
+PPR.ppt <- ggplot(PPR.data) + 
+  geom_smooth(aes(x=distance, y=ppt), method="lm", se=FALSE, color="black", size=0.5) + 
+  geom_point(aes(x=distance, y=ppt, fill="black", alpha=0.5), size=3) + 
+  theme_classic() +
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  ylim(0,13.5)
+
+PAM.ppt <- ggplot(PAM.data) + 
+  geom_smooth(aes(x=distance, y=ppt), method="lm", se=FALSE, color="black", size=0.5) + 
+  geom_point(aes(x=distance, y=ppt, fill="black", alpha=0.5), size=3) + 
+  theme_classic() + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  ylim(0,13.5)
+
+MAS.pH <- ggplot(MAS.data) + 
+  geom_smooth(aes(x=distance, y=avg.pH), method="lm", se=FALSE, color="black", size=0.5) + 
+  geom_point(aes(x=distance, y=avg.pH, fill="black", alpha=0.5), size=3) + 
+  theme_classic() + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  ylim(3.7,6.1)
+
+PPR.pH <- ggplot(PPR.data) + 
+  geom_smooth(aes(x=distance, y=avg.pH), method="lm", se=FALSE, color="black", size=0.5) + 
+  geom_point(aes(x=distance, y=avg.pH, fill="black", alpha=0.5), size=3) + 
+  theme_classic() +
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  ylim(3.7,6.1)
+
+PAM.pH <- ggplot(PAM.data) + 
+  geom_smooth(aes(x=distance, y=avg.pH), method="lm", se=FALSE, color="black", size=0.5) + 
+  geom_point(aes(x=distance, y=avg.pH, fill="black", alpha=0.5), size=3) + 
+  theme_classic() + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  ylim(3.7,6.1)
+
+MAS.elev <- ggplot(MAS.data) +
+  geom_smooth(aes(x=distance, y=elevation), method="lm", se=FALSE, color="black", size=0.5) + 
+  geom_point(aes(x=distance, y=elevation, fill="black", alpha=0.5), size=3) + 
+  theme_classic() + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  ylim(0.2, 0.7)
+
+PPR.elev <- ggplot(PPR.data) + 
+  geom_smooth(aes(x=distance, y=elevation), method="lm", se=FALSE, color="black", size=0.5) + 
+  geom_point(aes(x=distance, y=elevation, fill="black", alpha=0.5), size=3) + 
+  theme_classic() +
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  ylim(0.2, 0.7)
+
+PAM.elev <- ggplot(PAM.data) + 
+  geom_smooth(aes(x=distance, y=elevation), method="lm", se=FALSE, color="black", size=0.5) + 
+  geom_point(aes(x=distance, y=elevation, fill="black", alpha=0.5), size=3) + 
+  theme_classic() + 
+  theme(plot.title=element_text(size=16), 
+        legend.position = "NONE",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  ylim(0.2, 0.7)
+ 
+
+sfig1 <- egg::ggarrange(MAS.under, PPR.under, PAM.under,
+               MAS.shrub, PPR.shrub, PAM.shrub, 
+               MAS.tree, PPR.tree, PAM.tree, 
+               MAS.dead, PPR.dead, PAM.dead, 
+               MAS.ppt, PPR.ppt, PAM.ppt,
+               MAS.pH, PPR.pH, PAM.pH,
+               MAS.elev, PPR.elev, PAM.elev,
+               ncol=3, nrow=7,bottom="distance from marsh (m)")
+
+ggsave(plot=sfig1,"SI Figure 1 Vegetation.png",  width = 6.25, height = 8.5, dpi=600)
+```
+
+#### S Figure 2: Variable correlations
+
+```{r}
+FXS <- 21
+FXC <- "black"
+FXF <- "black"
+
+summary(lm(ppt~elevation, data=env))
+summary(lm(avg.pH~elevation, data=env)) 
+summary(lm(avg.pH~ppt, data=env)) 
+summary(lm(percent.sm~elevation, data=env)) 
+summary(lm(percent.sm~ppt, data=env)) 
+
+elev.ppt <- ggplot(env, aes(x=elevation, y=ppt)) + 
+  geom_point(size=4, shape=FXS, color=FXC, fill=FXF, alpha=0.5) + 
+  theme_classic() + 
+  ylab("Salinity (ppt)") + 
+  xlab("elevation (m)") + 
+  theme(axis.title.x = element_blank()) + 
+  geom_label(aes(x = 0.6, y = 12.5, label = "R: -0.048"), size=3) + 
+  ggtitle("A")
+
+elev.pH <- ggplot(env, aes(x=elevation, y=avg.pH)) + 
+  geom_point(size=4, shape=FXS, color=FXC, fill=FXF, alpha=0.5) + 
+  theme_classic() + 
+  ylab("pH")  + 
+  ylim(4,8) + 
+  theme(axis.title.x = element_blank())  + 
+  geom_label(aes(x = 0.6, y = 7.5, label = "R: -0.248"), size=3) + 
+  ggtitle("B")
+
+ppt.pH <- ggplot(env, aes(x=ppt, y=avg.pH)) + 
+  geom_point(size=4, shape=FXS, color=FXC, fill=FXF, alpha=0.5) + 
+  theme_classic() + 
+  geom_smooth(method="glm", 
+              method.args=list(family=gaussian(link="log")), 
+              fill=FXC,  color=FXC,
+              linewidth=0.5, alpha=0.25) + 
+  ylim(4,8) + 
+  theme(axis.title.y = element_blank(), axis.title.x = element_blank())  + 
+  geom_label(aes(x = 11, y = 7.5, label = "R: 0.647"), size=3) + 
+  ggtitle("C")
+
+
+elev.sm <- ggplot(env, aes(x=elevation, y=percent.sm)) + 
+  geom_point(size=4, shape=FXS, color=FXC, fill=FXF, alpha=0.5) + 
+  theme_classic() + 
+  geom_smooth(method="glm", 
+              method.args=list(family=gaussian(link="log")), 
+              fill=FXC,  color=FXC,
+              linewidth=0.5, alpha=0.25) + 
+  ylab("Soil moisture (%)") + 
+  xlab("elevation (m)")  + 
+  ylim(38,110) +
+  geom_label(aes(x = 0.6, y = 100, label = "R: -0.570"), size=3) + 
+  ggtitle("D")
+
+
+ppt.sm <- ggplot(env, aes(x=ppt, y=percent.sm)) + 
+  geom_point(size=4, shape=FXS, color=FXC, fill=FXF, alpha=0.5) + 
+  theme_classic() + 
+  xlab("Salinity (ppt)") + 
+  ylim(38,110) +
+  theme(axis.title.y = element_blank())  + 
+  geom_label(aes(x = 11, y = 100, label = "R: 0.222"), size=3) + 
+  ggtitle("E")
+
+spacer <- ggplot() + theme_void()
+
+sfig2 <- egg::ggarrange(elev.ppt, spacer, elev.pH, ppt.pH, elev.sm, ppt.sm, 
+          nrow=3, ncol=2)
+
+ggsave(plot=sfig2, "SI Figure 2 Variable Correlation.png", width = 4.5, height = 5.5, dpi=600)
+```
+
