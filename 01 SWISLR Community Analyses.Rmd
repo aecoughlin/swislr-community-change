@@ -589,16 +589,6 @@ cor(env$elevation, env$percent.sm) # -0.5699092
 cor(env$ppt, env$percent.sm)# 0.2215169
 ```
 
-
-### Microbial Phyla
-
-##### Figure 4
-
-```{r}
-
-```
-
-
 ### Generalized Dissimilarity Models
 
 ```{r}
@@ -987,7 +977,7 @@ bac.fun.mantel
 # Significance: 1e-04 
 ```
 
-##### FIGURE 5: Plotting Distance Matrices
+##### FIGURE 4: Plotting Distance Matrices
 
 ```{r}
 # create lists of distance value for each row/col combination (except Woody Vegetation) #
@@ -1118,7 +1108,7 @@ microbe.mant <- ggplot() +
 fig5 <- ggpubr::ggarrange(bac.cov.mant, bac.pcq.mant, fun.cov.mant, fun.pcq.mant, pcq.cov.mant, microbe.mant, 
                   labels=c("A","B","C","D","E","F"), nrow=3, ncol=2)
 
-ggsave("Figure 5 Mantel.png", plot=fig5, width=6, height=7, dpi=600)
+ggsave("Figure 4 Mantel.png", plot=fig5, width=6, height=7, dpi=600)
 ```
 
 ### TITAN Analyses
@@ -1242,7 +1232,7 @@ plot_taxa_ridges(bac.pH.titan)
 plot_taxa_ridges(bac.elev.titan) 
 ```
 
-##### Figure 6 TITAN 
+##### Figure 5 TITAN 
 
 ```{r}
 # Fungal change point and density plots
@@ -1281,7 +1271,7 @@ ggarrange(fun.ppt.titan.plot, fun.pH.titan.plot, fun.elev.titan.plot,
           bac.ppt.titan.plot, bac.pH.titan.plot, bac.elev.titan.plot, 
           labels=c("A", "B","C","D","E","F")) 
 
-ggsave("Figure 6 TITAN.png", width = 6, height = 4, dpi=600)
+ggsave("Figure 5 TITAN.png", width = 6, height = 4, dpi=600)
 
 ```
 
